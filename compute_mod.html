@@ -1,0 +1,610 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset='utf-8'> <!-- 文字エンコードを UTF-8 に指定 -->
+    <meta name='viewport' content='width=device-width, initial-scale=1, user-scalable=no'> <!-- モバイル向けの表示領域設定 -->
+    <meta name='mobile-web-app-capable' content='yes'> <!-- Android での PWA 表示を許可 -->
+    <meta name='apple-mobile-web-app-capable' content='yes'> <!-- iOS での PWA 表示を許可 -->
+    <title>WebGPU Particle XR</title> <!-- ページタイトル -->
+    <style>
+      body,html { /* ページ全体の基本スタイル */
+        width:100% ; /* 横幅を全体に */
+        height:100% ; /* 高さを全体に */
+        margin:0 ; /* 余白をなくす */
+      }
+      canvas { /* 画面いっぱいにキャンバスを広げる */
+        width:100% ; /* キャンバスの横幅 */
+        height:100%  /* キャンバスの高さ */
+      }
+      header { /* 操作説明の表示位置 */
+        position: absolute ; /* 画面上に固定配置 */
+        color:white ; /* 文字色を白に */
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <details open> <!-- 説明パネルを最初から開く -->
+        <summary>WebGPU Particle XR</summary> <!-- 説明パネルのタイトル -->
+        <p>
+          WebGPU と WebXR だけで多数の半透明パーティクルを描画するデモです。すべての動きは
+          compute shader 内で生成され、Fragment Shader が柔らかい発光表現を行います。
+          <a class="back" href="./">Back</a> <!-- 親ディレクトリへ戻るリンク -->
+        </p>
+        <button id="xr-button" class="barebones-button" disabled>WebXR or WebGPU not supported</button> <!-- XR 開始ボタン -->
+        <button id="hot-reload" class="barebones-button">Hot Reload</button> <!-- シェーダー/データの再読み込み -->
+        <button><a href="index.html" target="_blank">open</a></button>
+      </details>
+    </header>
+    <canvas id='webgpu_canvas'></canvas> <!-- WebGPU 描画用キャンバス -->
+    <script type='module'>
+      // 'secondary-views' 機能を使っていないので WebXR が提供するビューは 2 つを超えない。
+      const MAX_VIEWS = 2; // XR で最大 2 眼分だけ扱う
+      // Uniform バッファの各ビュー領域は 64 個の float を確保して 256 バイト境界に合わせる。
+      const UNIFORM_FLOATS_PER_VIEW = 64; // 1 ビューあたりの Uniform 領域サイズ
+
+      let particleCount = 0; // パーティクル数
+      let computeWorkgroupSize = 0; // Compute のワークグループサイズ
+      let shaderSrc = ''; // 描画用シェーダー
+      let computeShaderSrc = ''; // Compute 用シェーダー
+      let assetsModule = null; // データ準備とシェーダーを分離したモジュール
+
+      // XR 関連のグローバル変数
+      const xrButton = document.getElementById('xr-button'); // XR ボタン要素
+      const hotReloadButton = document.getElementById('hot-reload'); // ホットリロードボタン
+      if (hotReloadButton) { // ボタンがあればイベント登録
+        hotReloadButton.addEventListener('click', reloadAssets); // クリックで再読み込み
+      }
+      let xrSession = null; // XR セッション
+      let xrRefSpace = null; // 参照空間
+
+      // WebGPU で使うシーン用のグローバル変数
+      let gpuDevice = null; // GPU デバイス
+      let gpuContext = null; // WebGPU の描画コンテキスト
+      let gpuUniformBuffer = null; // カメラ用 Uniform バッファ
+      let gpuUniformArray = new Float32Array(UNIFORM_FLOATS_PER_VIEW * MAX_VIEWS); // Uniform バッファの CPU 側配列
+      let gpuRenderBindGroupLayout = null; // 描画用のバインドグループレイアウト
+      let gpuBindGroups = []; // ビューごとのバインドグループ
+      let gpuModule = null; // 描画用シェーダーモジュール
+      let gpuComputeModule = null; // Compute 用シェーダーモジュール
+      let gpuPipeline = null; // 描画パイプライン
+      let gpuComputePipeline = null; // Compute パイプライン
+      let gpuDepthTexture = null; // 深度テクスチャ
+      let colorFormat = null; // カラーのフォーマット
+      let depthStencilFormat = 'depth24plus'; // 深度フォーマット
+      let gpuParticleSeedBuffer = null; // シード用バッファ
+      let gpuParticleStateBuffer = null; // 状態書き込み用バッファ
+      let gpuComputeBindGroupLayout = null; // Compute 用バインドグループレイアウト
+      let gpuComputeBindGroup = null; // Compute 用バインドグループ
+      let gpuComputeUniformBuffer = null; // Compute 用 Uniform バッファ
+      let gpuComputeUniformArray = new Float32Array(4); // Compute 用 Uniform の CPU 配列
+      let timeSeconds = 0; // 秒単位の時間
+
+      // WebXR と WebGPU を連携させるためのグローバル変数
+      let xrGpuBinding = null; // WebXR/WebGPU のバインディング
+      let projectionLayer = null; // 投影レイヤー
+
+      // gl-matrix 由来の処理で射影行列を生成する。
+      function perspectiveZO(out, fovy, aspect, near, far = Infinity) {
+        const f = 1.0 / Math.tan(fovy / 2); // 画角からスケールを算出
+        out[0] = f / aspect; // X 方向のスケール
+        out[1] = 0; // ここは 0
+        out[2] = 0; // ここは 0
+        out[3] = 0; // ここは 0
+        out[4] = 0; // ここは 0
+        out[5] = f; // Y 方向のスケール
+        out[6] = 0; // ここは 0
+        out[7] = 0; // ここは 0
+        out[8] = 0; // ここは 0
+        out[9] = 0; // ここは 0
+        out[11] = -1; // Z を射影する係数
+        out[12] = 0; // 平行移動 X
+        out[13] = 0; // 平行移動 Y
+        out[15] = 0; // w 成分
+        if (far != null && far !== Infinity) { // 有限の far のとき
+          const nf = 1 / (near - far); // 逆数
+          out[10] = far * nf; // Z 変換
+          out[14] = far * near * nf; // Z 平行移動
+        } else { // far が無限大の場合
+          out[10] = -1; // 無限遠向けの係数
+          out[14] = -near; // near を使った係数
+        }
+        return out; // 計算済み行列を返す
+      }
+
+      async function loadAssetsModule({ bustCache = false } = {}) {
+        const cacheBuster = bustCache ? `?t=${Date.now()}` : ''; // ホットリロード用のキャッシュ回避
+        assetsModule = await import(`./compute-assets.js${cacheBuster}`); // 分離モジュールを読み込む
+        particleCount = assetsModule.PARTICLE_COUNT; // パーティクル数を更新
+        computeWorkgroupSize = assetsModule.COMPUTE_WORKGROUP_SIZE; // ワークグループサイズ
+        shaderSrc = assetsModule.SHADER_SRC; // 描画シェーダー
+        computeShaderSrc = assetsModule.COMPUTE_SHADER_SRC; // Compute シェーダー
+      }
+
+      // WebXR と WebGPU が利用可能かを確認し、望むセッションタイプをサポートするか検証する。
+      async function initXR() {
+        // このユーザーエージェントで WebXR・WebGPU・両者の連携機能が利用可能かを確認する。
+        if (!navigator.xr) { // WebXR が無い場合
+          xrButton.textContent = 'WebXR not supported'; // ボタンに表示
+          return; // 以降を中止
+        }
+
+        if (!navigator.gpu) { // WebGPU が無い場合
+          xrButton.textContent = 'WebGPU not supported'; // ボタンに表示
+          return; // 以降を中止
+        }
+
+        if (!('XRGPUBinding' in window)) { // XR と GPU の連携が無い場合
+          xrButton.textContent = 'WebXR/WebGPU interop not supported'; // 表示を更新
+//         return; // 連携が無い場合も続行可能ならコメントアウト
+        }
+
+        // この UA が immersive-vr セッションを許可していれば「Enter XR」ボタンを有効化する。
+        const supported = await navigator.xr.isSessionSupported('immersive-vr'); // VR セッション可否
+        if (!supported) { // VR 非対応なら
+          xrButton.textContent = 'Immersive VR not supported'; // 表示を更新
+  //        return; // 必要なら中止
+        }
+
+        // クリックで XR セッションを開始できるようボタンを更新する。
+        xrButton.addEventListener('click', onButtonClicked); // クリックイベント登録
+        xrButton.textContent = 'Enter VR'; // ボタン文言変更
+        xrButton.disabled = false; // ボタンを有効化
+
+        await initWebGPU(); // WebGPU の初期化
+        requestAnimationFrame(onFrame); // 通常描画を開始
+      }
+
+      // WebGPU の各種リソースを初期化する
+      async function initWebGPU({ recreateBuffers = false } = {}) {
+        if (!gpuDevice) { // まだデバイス未作成なら初期化
+          // 表示対象の XRDisplay と互換性を持つ WebGPU アダプターとデバイスを作成する。
+          // XR デバイスだけに描画するならキャンバスは不要。
+          const adapter = await navigator.gpu.requestAdapter({ // アダプター取得
+            xrCompatible: true // XR 対応のアダプターを要求
+          });
+          gpuDevice = await adapter.requestDevice(); // デバイス生成
+          colorFormat = navigator.gpu.getPreferredCanvasFormat(); // 推奨カラーフォーマット
+
+          gpuContext = webgpu_canvas.getContext('webgpu'); // WebGPU コンテキスト
+          gpuContext.configure({ // キャンバスを WebGPU 用に設定
+            format: colorFormat, // カラーフォーマット
+            device: gpuDevice, // 使用デバイス
+          });
+
+          // immersive セッション外で使うデプステクスチャ。
+          gpuDepthTexture = gpuDevice.createTexture({ // 深度テクスチャを作成
+            size: { width: webgpu_canvas.width, height: webgpu_canvas.height }, // キャンバスサイズ
+            format: depthStencilFormat, // 深度フォーマット
+            usage: GPUTextureUsage.RENDER_ATTACHMENT, // レンダーターゲット用
+          });
+
+          // ビューごとに必要な Uniform を格納できるだけのバッファを確保する。
+          gpuUniformBuffer = gpuDevice.createBuffer({ // Uniform バッファ生成
+            size: Float32Array.BYTES_PER_ELEMENT * UNIFORM_FLOATS_PER_VIEW * MAX_VIEWS, // バッファサイズ
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, // Uniform とコピー用途
+          });
+
+          // 何か表示できるように最初から有効な行列と時間を入れておく。
+          const identity = [ // 単位行列
+            1, 0, 0, 0,
+            0, 1, 0, 0,
+            0, 0, 1, 0,
+            0, 0, 0, 1
+          ];
+          gpuUniformArray.set(identity, 16); // view 行列部分に設定
+
+          const proj = new Array(16).fill(0); // 射影行列の配列
+          perspectiveZO(proj, Math.PI * 0.45, webgpu_canvas.offsetWidth / webgpu_canvas.offsetHeight, 0.1); // 射影行列を計算
+          gpuUniformArray.set(proj, 0); // projection を書き込む
+          for (let i = 0; i < MAX_VIEWS; ++i) { // ビューごとの時間領域
+            gpuUniformArray[UNIFORM_FLOATS_PER_VIEW * i + 32] = 0; // time を 0 で初期化
+          }
+
+          gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray); // Uniform バッファへ転送
+
+          // Compute パラメータ(time/個数)を共有する Uniform バッファ
+          gpuComputeUniformBuffer = gpuDevice.createBuffer({ // Compute 用 Uniform
+            size: Float32Array.BYTES_PER_ELEMENT * 4, // 4 要素分
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, // Uniform とコピー
+          });
+          gpuComputeUniformArray[0] = 0; // time の初期値
+          gpuComputeUniformArray[1] = particleCount; // 粒数を設定
+          gpuDevice.queue.writeBuffer(gpuComputeUniformBuffer, 0, gpuComputeUniformArray); // 書き込み
+
+          // Uniform + パーティクル用のバインドグループレイアウト
+          gpuRenderBindGroupLayout = gpuDevice.createBindGroupLayout({ // 描画用レイアウト
+            entries: [{ // エントリ 0
+              binding: 0, // バインディング番号
+              visibility: GPUShaderStage.VERTEX, // 頂点シェーダーで利用
+              buffer: { // バッファ設定
+                type: 'uniform', // Uniform バッファ
+              },
+            }]
+          });
+
+          // Compute 用の Uniform/Seed/State バッファをまとめてバインドするレイアウト
+          gpuComputeBindGroupLayout = gpuDevice.createBindGroupLayout({ // Compute 用レイアウト
+            entries: [{ // Uniform
+              binding: 0, // バインディング番号
+              visibility: GPUShaderStage.COMPUTE, // Compute で利用
+              buffer: { // バッファ設定
+                type: 'uniform', // Uniform バッファ
+              },
+            }, { // シード
+              binding: 1, // バインディング番号
+              visibility: GPUShaderStage.COMPUTE, // Compute で利用
+              buffer: { // バッファ設定
+                type: 'read-only-storage', // 読み取り専用
+              },
+            }, { // 状態
+              binding: 2, // バインディング番号
+              visibility: GPUShaderStage.COMPUTE, // Compute で利用
+              buffer: { // バッファ設定
+                type: 'storage', // 読み書き
+              },
+            }]
+          });
+
+          gpuBindGroups = []; // 配列を初期化
+          for (let i = 0; i < MAX_VIEWS; ++i) { // ビュー数分作成
+            gpuBindGroups.push(gpuDevice.createBindGroup({ // バインドグループを追加
+              layout: gpuRenderBindGroupLayout, // レイアウト指定
+              entries: [{ // Uniform のバインド
+                binding: 0, // バインディング番号
+                resource: { // リソース指定
+                  buffer: gpuUniformBuffer, // 対象バッファ
+                  offset: Float32Array.BYTES_PER_ELEMENT * UNIFORM_FLOATS_PER_VIEW * i, // 各ビューのオフセット
+                  size: Float32Array.BYTES_PER_ELEMENT * UNIFORM_FLOATS_PER_VIEW, // サイズ
+                }
+              }]
+            }));
+          }
+
+        }
+
+        await rebuildGpuAssets({ recreateBuffers }); // シェーダーとデータの再構築
+      }
+
+      // ユーザーが「Enter XR」を押したときに呼ばれる。セッション未開始なら要求し、既に開始していれば終了する。
+      async function onButtonClicked() {
+        if (!xrSession) { // まだセッションが無ければ開始
+          navigator.xr.requestSession('immersive-vr', { // immersive-vr を要求
+            requiredFeatures: ['webgpu'], // WebGPU 連携を必須に
+          }).then(onSessionStarted); // 成功したら開始処理
+        } else { // 既にセッション中なら
+          xrSession.end(); // セッション終了
+        }
+      }
+
+      // XRSession の取得に成功したときに呼ばれ、セッション状態を初期化してフレームループを開始する。
+      async function onSessionStarted(session) {
+        xrSession = session; // セッションを保存
+        xrButton.textContent = 'Exit VR'; // ボタン文言を更新
+
+        // ユーザーまたは UA が何らかの理由で終了したときに備え 'end' イベントを監視する。
+        session.addEventListener('end', onSessionEnded); // end イベント登録
+
+        // WebXR/WebGPU のバインディングを作成し、描画先となる投影レイヤーを生成する。
+        xrGpuBinding = new XRGPUBinding(xrSession, gpuDevice); // バインディング作成
+
+        // 望ましいカラーフォーマットがこれまでと異なっていればパイプラインを再構築する。
+        if (colorFormat != xrGpuBinding.getPreferredColorFormat()) { // フォーマット差異を確認
+          colorFormat = xrGpuBinding.getPreferredColorFormat(); // XR 推奨のフォーマットへ
+          await initWebGPU(); // パイプラインを再構築
+        }
+
+        projectionLayer = xrGpuBinding.createProjectionLayer({ // 投影レイヤー作成
+          colorFormat, // カラーフォーマット
+          depthStencilFormat, // 深度フォーマット
+        });
+
+        // セッションの表示レイヤーとして投影レイヤーを設定し、その内容が XR デバイスに映るようにする。
+        session.updateRenderState({ layers: [projectionLayer] }); // レイヤーを更新
+
+        // ポーズ取得に必要なリファレンス空間を要求する。ここでは 'local' を用い、最初にデバイスを検出した位置を基準にする。
+        session.requestReferenceSpace('local').then((refSpace) => { // local 空間を取得
+          xrRefSpace = refSpace; // 参照空間を保存
+
+          // 描画を開始できることをセッションに通知する。
+          session.requestAnimationFrame(onXRFrame); // XR フレームループ開始
+        });
+      }
+
+      // session.end() を呼んだ場合や UA に終了された場合に呼ばれ、セッションは再利用できないので破棄する。
+      async function onSessionEnded(event) {
+        xrSession = null; // セッションを破棄
+        xrGpuBinding = null; // バインディングを破棄
+        xrButton.textContent = 'Enter VR'; // ボタン文言を戻す
+
+        // キャンバスのカラーフォーマットが XR 用と異なるなら、戻る際に再度パイプラインを再構築。
+        if (colorFormat != navigator.gpu.getPreferredCanvasFormat()) { // 通常用と差があるか
+          colorFormat = navigator.gpu.getPreferredCanvasFormat(); // 通常用に戻す
+          await initWebGPU(); // 再構築
+        }
+
+        requestAnimationFrame(onFrame); // 通常描画ループへ戻す
+      }
+
+      // XRSession から新しいフレーム描画が要求されるたびに呼ばれる。
+      function onXRFrame(time, frame) {
+        timeSeconds = time * 0.001; // ms を秒に変換
+        let session = frame.session; // セッション参照
+
+        // 次のフレームに備えられることをセッションへ通知。
+        session.requestAnimationFrame(onXRFrame); // 次フレームを予約
+
+        // 先ほど作成したリファレンス空間に対する XR デバイスの姿勢を取得する。
+        let pose = frame.getViewerPose(xrRefSpace); // ビューアーの姿勢取得
+
+        // トラッキング喪失などでポーズ取得が失敗する場合があるので、描画前に有効なポーズか確認する。
+        if (pose) { // 有効なポーズがある場合のみ描画
+          // 各ビューを巡回して必要な行列と時間を Uniform バッファに保存する。
+          for (let viewIndex = 0; viewIndex < pose.views.length; ++viewIndex) { // 各ビューを処理
+            const view = pose.views[viewIndex]; // ビュー取得
+            const offset = UNIFORM_FLOATS_PER_VIEW * viewIndex; // バッファ内のオフセット
+            gpuUniformArray.set(view.projectionMatrix, offset); // 射影行列を書き込み
+            gpuUniformArray.set(view.transform.inverse.matrix, offset + 16); // ビュー行列を書き込み
+            gpuUniformArray[offset + 32] = timeSeconds; // 時間を設定
+          }
+          gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray); // Uniform バッファ更新
+
+          if (gpuComputeUniformBuffer) { // Compute 用バッファがあれば
+            gpuComputeUniformArray[0] = timeSeconds; // 時間を更新
+            gpuDevice.queue.writeBuffer(gpuComputeUniformBuffer, 0, gpuComputeUniformArray); // 書き込み
+          }
+
+          const commandEncoder = gpuDevice.createCommandEncoder(); // コマンドエンコーダ作成
+          runComputePass(commandEncoder); // Compute パスを実行
+
+          // 次に各ビューに対応する投影レイヤーのサブイメージへ描画する。
+          for (let viewIndex = 0; viewIndex < pose.views.length; ++viewIndex) { // 各ビューで描画
+            const view = pose.views[viewIndex]; // ビュー取得
+            let subImage = xrGpuBinding.getViewSubImage(projectionLayer, view); // サブイメージ取得
+
+            const renderPass = commandEncoder.beginRenderPass({ // レンダーパス開始
+                colorAttachments: [{ // カラーアタッチメント
+                  view: subImage.colorTexture.createView(subImage.getViewDescriptor()), // ビュー用のカラー
+                  loadOp: 'clear', // クリアして開始
+                  storeOp: 'store', // 描画結果を保持
+                  clearValue: [0.02, 0.02, 0.08, 1.0], // 背景色
+                }],
+                depthStencilAttachment: { // 深度アタッチメント
+                  view: subImage.depthStencilTexture.createView(subImage.getViewDescriptor()), // ビュー用の深度
+                  depthLoadOp: 'clear', // 深度をクリア
+                  depthStoreOp: 'store', // 深度を保持
+                  depthClearValue: 1.0, // 深度クリア値
+                }
+              });
+
+            let vp = subImage.viewport; // ビューポート取得
+            renderPass.setViewport(vp.x, vp.y, vp.width, vp.height, 0.0, 1.0); // ビューポート設定
+
+            drawScene(renderPass, viewIndex); // 実際の描画
+
+            renderPass.end(); // レンダーパス終了
+          }
+
+          // 記録したレンダリングコマンドを GPU に送信する。
+          gpuDevice.queue.submit([commandEncoder.finish()]); // コマンド送信
+        }
+      }
+
+      // 通常のキャンバス描画を行う
+      function onFrame(time) {
+        timeSeconds = time * 0.001; // ms を秒へ変換
+        if (!xrSession) { // XR でない場合だけ継続
+          requestAnimationFrame(onFrame); // 次のフレームを予約
+        }
+
+        gpuUniformArray[32] = timeSeconds; // 時間を書き込む
+        gpuDevice.queue.writeBuffer(gpuUniformBuffer, 0, gpuUniformArray); // Uniform を更新
+
+        if (gpuComputeUniformBuffer) { // Compute 用バッファがあれば
+          gpuComputeUniformArray[0] = timeSeconds; // 時間更新
+          gpuDevice.queue.writeBuffer(gpuComputeUniformBuffer, 0, gpuComputeUniformArray); // 書き込み
+        }
+
+        const commandEncoder = gpuDevice.createCommandEncoder(); // コマンドエンコーダ
+        runComputePass(commandEncoder); // Compute パスを実行
+
+        const renderPass = commandEncoder.beginRenderPass({ // レンダーパス開始
+          colorAttachments: [{ // カラーアタッチメント
+            view: gpuContext.getCurrentTexture().createView(), // 現在のテクスチャ
+            loadOp: 'clear', // クリア
+            storeOp: 'store', // 保存
+            clearValue: [0.02, 0.02, 0.08, 1.0], // 背景色
+          }],
+          depthStencilAttachment: { // 深度アタッチメント
+            view: gpuDepthTexture.createView(), // 深度テクスチャ
+            depthLoadOp: 'clear', // クリア
+            depthStoreOp: 'store', // 保存
+            depthClearValue: 1.0, // クリア値
+          }
+        });
+
+        drawScene(renderPass); // 描画
+
+        renderPass.end(); // レンダーパス終了
+
+        gpuDevice.queue.submit([commandEncoder.finish()]); // コマンド送信
+      }
+
+      // 描画前に必ず Compute パスを走らせ、最新位置/色を頂点バッファに書き込む。
+      function runComputePass(commandEncoder) {
+        if (!gpuComputePipeline) { // パイプラインが無いなら
+          return; // 何もしない
+        }
+
+        const computePass = commandEncoder.beginComputePass(); // Compute パス開始
+        computePass.setPipeline(gpuComputePipeline); // パイプライン設定
+        computePass.setBindGroup(0, gpuComputeBindGroup); // バインドグループ設定
+        const workgroupCount = Math.ceil(particleCount / computeWorkgroupSize); // 必要なグループ数
+        computePass.dispatchWorkgroups(workgroupCount); // Workgroup を実行
+        computePass.end(); // Compute パス終了
+      }
+
+      // Compute で用意した per-instance 頂点情報を読み込んで描画。
+      function drawScene(renderPass, viewIndex = 0) {
+        renderPass.setPipeline(gpuPipeline); // 描画パイプラインを設定
+        renderPass.setBindGroup(0, gpuBindGroups[viewIndex]); // ビュー用の Uniform を設定
+        renderPass.setVertexBuffer(0, gpuParticleStateBuffer); // インスタンスバッファを設定
+        renderPass.draw(6, particleCount); // 6 頂点のクアッドを粒数分描画
+      }
+
+      // XR アプリケーションをスタートさせる。
+      async function rebuildGpuAssets({ recreateBuffers = false } = {}) {
+        if (!gpuDevice) { // GPU デバイスが無いなら何もしない
+          return;
+        }
+
+        if (recreateBuffers || !gpuParticleSeedBuffer || !gpuParticleStateBuffer) { // パーティクルバッファを再生成
+          const particleSeeds = assetsModule.createParticleSeeds(); // シード生成
+          gpuParticleSeedBuffer = gpuDevice.createBuffer({ // シード用バッファ
+            size: particleSeeds.byteLength, // 必要サイズ
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST, // ストレージ + コピー
+          });
+          gpuDevice.queue.writeBuffer(gpuParticleSeedBuffer, 0, particleSeeds); // シードを書き込み
+
+          // Compute Shader から書き込み、レンダーパスでは頂点バッファとして読む。
+          gpuParticleStateBuffer = gpuDevice.createBuffer({ // パーティクル状態バッファ
+            size: particleCount * Float32Array.BYTES_PER_ELEMENT * 8, // 位置+色の合計サイズ
+            usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX, // 書き込みと頂点読取
+          });
+        }
+
+        if (gpuComputeUniformBuffer) { // Compute Uniform があるなら粒数を更新
+          gpuComputeUniformArray[1] = particleCount; // 粒数を更新
+          gpuDevice.queue.writeBuffer(gpuComputeUniformBuffer, 0, gpuComputeUniformArray); // Uniform 更新
+        }
+
+        gpuModule = gpuDevice.createShaderModule({ code: shaderSrc }); // 描画シェーダーを作成
+        gpuComputeModule = gpuDevice.createShaderModule({ code: computeShaderSrc }); // Compute シェーダーを作成
+
+        gpuComputeBindGroup = gpuDevice.createBindGroup({ // Compute 用バインドグループ
+          layout: gpuComputeBindGroupLayout, // レイアウト指定
+          entries: [{ // Uniform
+            binding: 0, // バインディング番号
+            resource: { // リソース指定
+              buffer: gpuComputeUniformBuffer, // Uniform バッファ
+            },
+          }, { // シード
+            binding: 1, // バインディング番号
+            resource: { // リソース指定
+              buffer: gpuParticleSeedBuffer, // シードバッファ
+            },
+          }, { // 状態
+            binding: 2, // バインディング番号
+            resource: { // リソース指定
+              buffer: gpuParticleStateBuffer, // 状態バッファ
+            },
+          }],
+        });
+
+        // Compute パイプラインでパーティクルの最新状態を書き出す
+        gpuComputePipeline = gpuDevice.createComputePipeline({ // Compute パイプライン作成
+          layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [gpuComputeBindGroupLayout] }), // レイアウト
+          compute: { // Compute ステージ
+            module: gpuComputeModule, // 使用モジュール
+            entryPoint: 'computeMain', // エントリーポイント
+          },
+        });
+
+        gpuPipeline = gpuDevice.createRenderPipeline({ // 描画パイプライン作成
+          layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [ gpuRenderBindGroupLayout ]}), // レイアウト
+          vertex: { // 頂点ステージ
+            module: gpuModule, // 使用モジュール
+            entryPoint: 'vertexMain', // エントリーポイント
+            buffers: [{ // インスタンスバッファのレイアウト
+              arrayStride: Float32Array.BYTES_PER_ELEMENT * 8, // 8 要素分
+              stepMode: 'instance', // インスタンス単位
+              attributes: [{ // centerSize
+                shaderLocation: 0, // ロケーション 0
+                offset: 0, // オフセット
+                format: 'float32x4', // vec4
+              }, { // color
+                shaderLocation: 1, // ロケーション 1
+                offset: Float32Array.BYTES_PER_ELEMENT * 4, // 4 要素後
+                format: 'float32x4', // vec4
+              }],
+            }],
+          },
+          depthStencil: { // 深度設定
+            format: depthStencilFormat, // 深度フォーマット
+            depthWriteEnabled: false, // 深度書き込みはしない
+            depthCompare: 'less-equal', // 深度比較方法
+          },
+          fragment: { // フラグメントステージ
+            module: gpuModule, // 使用モジュール
+            entryPoint: 'fragmentMain', // エントリーポイント
+            targets: [{ // レンダーターゲット
+              format: colorFormat, // カラーフォーマット
+              blend: { // 半透明合成
+                color: { // RGB 合成
+                  srcFactor: 'src-alpha', // ソース係数
+                  dstFactor: 'one-minus-src-alpha', // 背景係数
+                  operation: 'add', // 加算
+                },
+                alpha: { // Alpha 合成
+                  srcFactor: 'one', // ソース係数
+                  dstFactor: 'one-minus-src-alpha', // 背景係数
+                  operation: 'add', // 加算
+                }
+              }
+            }]
+          },
+          primitive: { // プリミティブ設定
+            topology: 'triangle-list', // 三角形リスト
+            cullMode: 'none', // カリングしない
+          }
+        });
+      }
+
+      async function reloadAssets() {
+        if (hotReloadButton) { // ボタンがある場合は二重押し防止
+          hotReloadButton.disabled = true; // 一時的に無効化
+        }
+
+        const previousCount = particleCount; // 変更前の粒数を保存
+        await loadAssetsModule({ bustCache: true }); // モジュールを再読み込み
+        const recreateBuffers = previousCount !== particleCount; // 粒数が変わった場合はバッファ再生成
+        await rebuildGpuAssets({ recreateBuffers }); // GPU リソースを更新
+
+        if (hotReloadButton) { // ボタンがある場合は再有効化
+          hotReloadButton.disabled = false; // 再度クリックできるように
+        }
+      }
+
+      window.reloadAssets = reloadAssets; // 外部から呼べるように公開
+
+      function connectHotReloadSocket() {
+        const wsProtocol = location.protocol === 'https:' ? 'wss' : 'ws'; // https なら wss を使用
+        const wsUrl = `${wsProtocol}://${location.hostname}/hotreload/`; // WebSocket サーバ URL
+        const socket = new WebSocket(wsUrl); // サーバへ接続
+
+        socket.addEventListener('message', (event) => {
+          if (event.data === 'reload') { // サーバからの指示
+            reloadAssets(); // モジュールを再読み込み
+          }
+        });
+
+        socket.addEventListener('close', () => {
+          setTimeout(connectHotReloadSocket, 1000); // 切断時は再接続
+        });
+
+        socket.addEventListener('error', () => {
+          socket.close(); // エラー時はクローズして再接続へ
+        });
+      }
+
+      // XR アプリケーションをスタートさせる。
+      async function boot() {
+        await loadAssetsModule(); // 初期モジュール読み込み
+        connectHotReloadSocket(); // ホットリロード通知の受信を開始
+        initXR(); // 初期化を実行
+      }
+
+      boot(); // 起動処理を開始
+    </script>
+  </body>
+</html>
