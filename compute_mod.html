@@ -112,9 +112,22 @@
         return out; // 計算済み行列を返す
       }
 
-      async function loadAssetsModule({ bustCache = false } = {}) {
+      let assetsModuleName = './compute-assets.js'; // 読み込むモジュール名
+
+      function resolveModulePath(name) {
+        if (!name) { // 空なら現状を使う
+          return assetsModuleName;
+        }
+        if (name.startsWith('.') || name.startsWith('/')) { // 既にパスならそのまま
+          return name;
+        }
+        return `./${name}`; // 相対パスとして扱う
+      }
+
+      async function loadAssetsModule({ bustCache = false, moduleName } = {}) {
+        assetsModuleName = resolveModulePath(moduleName); // 指定があれば差し替え
         const cacheBuster = bustCache ? `?t=${Date.now()}` : ''; // ホットリロード用のキャッシュ回避
-        assetsModule = await import(`./compute-assets.js${cacheBuster}`); // 分離モジュールを読み込む
+        assetsModule = await import(`${assetsModuleName}${cacheBuster}`); // 分離モジュールを読み込む
         particleCount = assetsModule.PARTICLE_COUNT; // パーティクル数を更新
         computeWorkgroupSize = assetsModule.COMPUTE_WORKGROUP_SIZE; // ワークグループサイズ
         shaderSrc = assetsModule.SHADER_SRC; // 描画シェーダー
@@ -452,10 +465,50 @@
         renderPass.draw(6, particleCount); // 6 頂点のクアッドを粒数分描画
       }
 
+      async function compileShaderModule(code, label) {
+        const module = gpuDevice.createShaderModule({ code }); // シェーダーモジュールを作成
+        const getInfo = module.compilationInfo || module.getCompilationInfo; // 実装差異を吸収
+        if (getInfo) { // 取得可能な場合のみ使う
+          const info = await getInfo.call(module); // コンパイル結果を取得
+          const errors = info.messages.filter((msg) => msg.type === 'error');
+          if (errors.length) { // エラーがあればログして失敗扱い
+            console.error(`Shader compile error (${label})`, errors);
+            return null;
+          }
+          const warnings = info.messages.filter((msg) => msg.type === 'warning');
+          if (warnings.length) { // 警告はログだけ出す
+            console.warn(`Shader compile warning (${label})`, warnings);
+          }
+        }
+        return module;
+      }
+
+      async function createPipelineWithValidation(createPipeline, label) {
+        gpuDevice.pushErrorScope('validation'); // パイプライン作成の検証エラーを捕捉
+        let pipeline = null;
+        try {
+          pipeline = createPipeline();
+        } catch (error) {
+          console.error(`Pipeline creation error (${label})`, error);
+        }
+        const gpuError = await gpuDevice.popErrorScope();
+        if (gpuError) {
+          console.error(`GPU validation error (${label})`, gpuError);
+          return null;
+        }
+        return pipeline;
+      }
+
       // XR アプリケーションをスタートさせる。
       async function rebuildGpuAssets({ recreateBuffers = false } = {}) {
         if (!gpuDevice) { // GPU デバイスが無いなら何もしない
-          return;
+          return false;
+        }
+
+        const nextGpuModule = await compileShaderModule(shaderSrc, 'render');
+        const nextGpuComputeModule = await compileShaderModule(computeShaderSrc, 'compute');
+        if (!nextGpuModule || !nextGpuComputeModule) { // コンパイル失敗なら現状維持
+          return false;
         }
 
         if (recreateBuffers || !gpuParticleSeedBuffer || !gpuParticleStateBuffer) { // パーティクルバッファを再生成
@@ -478,9 +531,6 @@
           gpuDevice.queue.writeBuffer(gpuComputeUniformBuffer, 0, gpuComputeUniformArray); // Uniform 更新
         }
 
-        gpuModule = gpuDevice.createShaderModule({ code: shaderSrc }); // 描画シェーダーを作成
-        gpuComputeModule = gpuDevice.createShaderModule({ code: computeShaderSrc }); // Compute シェーダーを作成
-
         gpuComputeBindGroup = gpuDevice.createBindGroup({ // Compute 用バインドグループ
           layout: gpuComputeBindGroupLayout, // レイアウト指定
           entries: [{ // Uniform
@@ -502,73 +552,100 @@
         });
 
         // Compute パイプラインでパーティクルの最新状態を書き出す
-        gpuComputePipeline = gpuDevice.createComputePipeline({ // Compute パイプライン作成
-          layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [gpuComputeBindGroupLayout] }), // レイアウト
-          compute: { // Compute ステージ
-            module: gpuComputeModule, // 使用モジュール
-            entryPoint: 'computeMain', // エントリーポイント
-          },
-        });
+        const nextGpuComputePipeline = await createPipelineWithValidation(() => (
+          gpuDevice.createComputePipeline({ // Compute パイプライン作成
+            layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [gpuComputeBindGroupLayout] }), // レイアウト
+            compute: { // Compute ステージ
+              module: nextGpuComputeModule, // 使用モジュール
+              entryPoint: 'computeMain', // エントリーポイント
+            },
+          })
+        ), 'compute');
 
-        gpuPipeline = gpuDevice.createRenderPipeline({ // 描画パイプライン作成
-          layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [ gpuRenderBindGroupLayout ]}), // レイアウト
-          vertex: { // 頂点ステージ
-            module: gpuModule, // 使用モジュール
-            entryPoint: 'vertexMain', // エントリーポイント
-            buffers: [{ // インスタンスバッファのレイアウト
-              arrayStride: Float32Array.BYTES_PER_ELEMENT * 8, // 8 要素分
-              stepMode: 'instance', // インスタンス単位
-              attributes: [{ // centerSize
-                shaderLocation: 0, // ロケーション 0
-                offset: 0, // オフセット
-                format: 'float32x4', // vec4
-              }, { // color
-                shaderLocation: 1, // ロケーション 1
-                offset: Float32Array.BYTES_PER_ELEMENT * 4, // 4 要素後
-                format: 'float32x4', // vec4
+        const nextGpuPipeline = await createPipelineWithValidation(() => (
+          gpuDevice.createRenderPipeline({ // 描画パイプライン作成
+            layout: gpuDevice.createPipelineLayout({ bindGroupLayouts: [ gpuRenderBindGroupLayout ]}), // レイアウト
+            vertex: { // 頂点ステージ
+              module: nextGpuModule, // 使用モジュール
+              entryPoint: 'vertexMain', // エントリーポイント
+              buffers: [{ // インスタンスバッファのレイアウト
+                arrayStride: Float32Array.BYTES_PER_ELEMENT * 8, // 8 要素分
+                stepMode: 'instance', // インスタンス単位
+                attributes: [{ // centerSize
+                  shaderLocation: 0, // ロケーション 0
+                  offset: 0, // オフセット
+                  format: 'float32x4', // vec4
+                }, { // color
+                  shaderLocation: 1, // ロケーション 1
+                  offset: Float32Array.BYTES_PER_ELEMENT * 4, // 4 要素後
+                  format: 'float32x4', // vec4
+                }],
               }],
-            }],
-          },
-          depthStencil: { // 深度設定
-            format: depthStencilFormat, // 深度フォーマット
-            depthWriteEnabled: false, // 深度書き込みはしない
-            depthCompare: 'less-equal', // 深度比較方法
-          },
-          fragment: { // フラグメントステージ
-            module: gpuModule, // 使用モジュール
-            entryPoint: 'fragmentMain', // エントリーポイント
-            targets: [{ // レンダーターゲット
-              format: colorFormat, // カラーフォーマット
-              blend: { // 半透明合成
-                color: { // RGB 合成
-                  srcFactor: 'src-alpha', // ソース係数
-                  dstFactor: 'one-minus-src-alpha', // 背景係数
-                  operation: 'add', // 加算
-                },
-                alpha: { // Alpha 合成
-                  srcFactor: 'one', // ソース係数
-                  dstFactor: 'one-minus-src-alpha', // 背景係数
-                  operation: 'add', // 加算
+            },
+            depthStencil: { // 深度設定
+              format: depthStencilFormat, // 深度フォーマット
+              depthWriteEnabled: false, // 深度書き込みはしない
+              depthCompare: 'less-equal', // 深度比較方法
+            },
+            fragment: { // フラグメントステージ
+              module: nextGpuModule, // 使用モジュール
+              entryPoint: 'fragmentMain', // エントリーポイント
+              targets: [{ // レンダーターゲット
+                format: colorFormat, // カラーフォーマット
+                blend: { // 半透明合成
+                  color: { // RGB 合成
+                    srcFactor: 'src-alpha', // ソース係数
+                    dstFactor: 'one-minus-src-alpha', // 背景係数
+                    operation: 'add', // 加算
+                  },
+                  alpha: { // Alpha 合成
+                    srcFactor: 'one', // ソース係数
+                    dstFactor: 'one-minus-src-alpha', // 背景係数
+                    operation: 'add', // 加算
+                  }
                 }
-              }
-            }]
-          },
-          primitive: { // プリミティブ設定
-            topology: 'triangle-list', // 三角形リスト
-            cullMode: 'none', // カリングしない
-          }
-        });
+              }]
+            },
+            primitive: { // プリミティブ設定
+              topology: 'triangle-list', // 三角形リスト
+              cullMode: 'none', // カリングしない
+            }
+          })
+        ), 'render');
+
+        if (!nextGpuComputePipeline || !nextGpuPipeline) {
+          return false;
+        }
+
+        gpuModule = nextGpuModule; // 成功したものだけ反映
+        gpuComputeModule = nextGpuComputeModule; // 成功したものだけ反映
+        gpuComputePipeline = nextGpuComputePipeline; // 成功したものだけ反映
+        gpuPipeline = nextGpuPipeline; // 成功したものだけ反映
+        return true;
       }
 
-      async function reloadAssets() {
+      async function reloadAssets({ moduleName } = {}) {
         if (hotReloadButton) { // ボタンがある場合は二重押し防止
           hotReloadButton.disabled = true; // 一時的に無効化
         }
-
+        console.log("reload "+moduleName)
         const previousCount = particleCount; // 変更前の粒数を保存
-        await loadAssetsModule({ bustCache: true }); // モジュールを再読み込み
-        const recreateBuffers = previousCount !== particleCount; // 粒数が変わった場合はバッファ再生成
-        await rebuildGpuAssets({ recreateBuffers }); // GPU リソースを更新
+        const previousWorkgroup = computeWorkgroupSize; // 変更前のワークグループサイズ
+        const previousShaderSrc = shaderSrc; // 変更前の描画シェーダー
+        const previousComputeShaderSrc = computeShaderSrc; // 変更前の Compute シェーダー
+        const previousModuleName = assetsModuleName; // 変更前のモジュール名
+        const previousAssetsModule = assetsModule; // 変更前のモジュール
+        await loadAssetsModule({ bustCache: true, moduleName }); // モジュールを再読み込み
+        const recreateBuffers = true; // 常にバッファ再生成して初期化
+        const rebuildOk = await rebuildGpuAssets({ recreateBuffers }); // GPU リソースを更新
+        if (!rebuildOk) { // 失敗時は元に戻して現状維持
+          particleCount = previousCount;
+          computeWorkgroupSize = previousWorkgroup;
+          shaderSrc = previousShaderSrc;
+          computeShaderSrc = previousComputeShaderSrc;
+          assetsModuleName = previousModuleName;
+          assetsModule = previousAssetsModule;
+        }
 
         if (hotReloadButton) { // ボタンがある場合は再有効化
           hotReloadButton.disabled = false; // 再度クリックできるように
@@ -583,8 +660,18 @@
         const socket = new WebSocket(wsUrl); // サーバへ接続
 
         socket.addEventListener('message', (event) => {
-          if (event.data === 'reload') { // サーバからの指示
+          if (event.data === 'reload') { // 旧フォーマット対応
             reloadAssets(); // モジュールを再読み込み
+            return;
+          }
+          let message = null;
+          try {
+            message = JSON.parse(event.data);
+          } catch (error) {
+            return;
+          }
+          if (message && message.type === 'reload') { // サーバからの指示
+            reloadAssets({ moduleName: message.module }); // モジュールを再読み込み
           }
         });
 

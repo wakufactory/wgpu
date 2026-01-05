@@ -11,9 +11,11 @@ const portIndex = argv.indexOf('--port');
 const fileIndex = argv.indexOf('--file');
 
 const port = portIndex !== -1 && argv[portIndex + 1] ? Number(argv[portIndex + 1]) : DEFAULT_PORT;
-const filePath = fileIndex !== -1 && argv[fileIndex + 1]
-  ? path.resolve(argv[fileIndex + 1])
+const rawFileArg = fileIndex !== -1 && argv[fileIndex + 1] ? argv[fileIndex + 1] : null;
+const filePath = rawFileArg
+  ? path.resolve(rawFileArg)
   : path.resolve(__dirname, 'compute-assets.js');
+const moduleName = rawFileArg || path.basename(filePath);
 
 if (!Number.isFinite(port)) {
   console.error('Invalid --port value.');
@@ -88,11 +90,13 @@ fs.watch(filePath, { persistent: true }, () => {
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(() => {
     console.log(`change detected: ${filePath}`);
-    broadcast('reload');
+    const payload = JSON.stringify({ type: 'reload', module: moduleName });
+    broadcast(payload);
   }, 100);
 });
 
 server.listen(port, () => {
   console.log(`watching: ${filePath}`);
+  console.log(`module: ${moduleName}`);
   console.log(`ws://localhost:${port}`);
 });

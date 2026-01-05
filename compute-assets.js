@@ -2,7 +2,7 @@
 export const PARTICLE_COUNT = 100000; // パーティクル数
 export const PARTICLE_SPREAD = 15.0; // 初期配置の広がり
 export const PARTICLE_MIN_SIZE = 0.08; // 粒の最小サイズ
-export const PARTICLE_MAX_SIZE = 0.25; // 粒の最大サイズ
+export const PARTICLE_MAX_SIZE = 0.15; // 粒の最大サイズ
 // Compute のワークグループサイズ
 export const COMPUTE_WORKGROUP_SIZE = 64; // Compute のワークグループサイズ
 
@@ -82,7 +82,7 @@ export const COMPUTE_SHADER_SRC = `
 
   fn animate(seed: vec4f, time: f32) -> vec3f { // 位置アニメーションを計算
     let t = time * 0.35 + seed.x; // 時間にシードを混ぜる
-    let lift = sin(t * 0.6 + seed.y) * 0.9; // 上下の揺れ
+    let lift = sin(t * 0.6 + seed.y) * 0.1; // 上下の揺れ
     let radius = 0.6 + fract(seed.y * 0.37) * 3.5; // 渦の半径
     let swirl = vec3f( // 渦巻きのオフセット
       cos(t) * radius, // X 方向
@@ -98,7 +98,7 @@ export const COMPUTE_SHADER_SRC = `
     return vec4f( // RGBA を返す
       0.2 + 0.8 * pulse, // R
       0.1 + 0.6 * (1.0 - pulse), // G
-      0.1 + 0.4 * pulse, // B
+      0.5 + 0.4 * pulse, // B
       0.35 + 0.35 * pulse // A
     );
   }
@@ -123,7 +123,7 @@ export function createParticleSeeds() {
   for (let i = 0; i < PARTICLE_COUNT; ++i) { // パーティクル数だけ繰り返す
     const offset = i * 4; // 4 要素単位の開始位置
     data[offset + 0] = (Math.random() - 0.5) * PARTICLE_SPREAD * 2.0; // X 位置
-    data[offset + 1] = (Math.random() - 0.5) * PARTICLE_SPREAD * 0.6; // Y 位置
+    data[offset + 1] = (Math.random() - 0.5) * PARTICLE_SPREAD * 0.01; // Y 位置
     data[offset + 2] = (Math.random() - 0.5) * PARTICLE_SPREAD * 2.0; // Z 位置
     data[offset + 3] = PARTICLE_MIN_SIZE + Math.random() * (PARTICLE_MAX_SIZE - PARTICLE_MIN_SIZE); // サイズ
   }
